@@ -637,22 +637,6 @@ class CustomPrioritizedReplayBuffer(PrioritizedReplayBuffer):
         self._it_min[idx] = priority ** self._alpha
         self._max_priority = max(self._max_priority, priority)
 
-    # def _encode_sample(self, idxes):
-    #     obses_t, actions, rewards, obses_tp1, dones = [], [], [], [], []
-    #     for i in idxes:
-    #         data = self._storage[i]
-    #         obs_t, action, reward, obs_tp1, done = data
-    #         obses_t.append(obs_t)
-    #         actions.append(np.array(action, copy=False))
-    #         rewards.append(np.array(reward, copy=False))
-    #         obses_tp1.append(obs_tp1)
-    #         dones.append(np.array(done, copy=False))
-    #     return (obses_t,
-    #             np.array(actions),
-    #             np.array(rewards),
-    #             obses_tp1,
-    #             np.array(dones))
-
 # Reference: https://www.cs.toronto.edu/~vmnih/docs/dqn.pdf
 
 import torch
@@ -672,69 +656,18 @@ import time
 import random
 import os
 
+import threading
+os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
+from torch import multiprocessing as mp
+from multiprocessing.managers import SyncManager
+
 import matplotlib
 matplotlib.use('Agg')
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
 from PIL import Image
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Double DQN Agent with prioritized experience replay')
-    # Common arguments
-    parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
-                        help='the name of this experiment')
-    parser.add_argument('--gym-id', type=str, default="BreakoutNoFrameskip-v4",
-                        help='the id of the gym environment')
-    parser.add_argument('--learning-rate', type=float, default=1e-4,
-                        help='the learning rate of the optimizer')
-    parser.add_argument('--seed', type=int, default=2,
-                        help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=10000000,
-                        help='total timesteps of the experiments')
-    parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                        help='if toggled, `torch.backends.cudnn.deterministic=False`')
-    parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                        help='if toggled, cuda will not be enabled by default')
-    parser.add_argument('--prod-mode', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
-                        help='run the script in production mode and use wandb to log outputs')
-    parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
-                        help='weather to capture videos of the agent performances (check out `videos` folder)')
-    parser.add_argument('--wandb-project-name', type=str, default="cleanRL",
-                        help="the wandb's project name")
-    parser.add_argument('--wandb-entity', type=str, default=None,
-                        help="the entity (team) of wandb's project")
-    
-    # Algorithm specific arguments
-    parser.add_argument('--buffer-size', type=int, default=1000000,
-                        help='the replay memory buffer size')
-    parser.add_argument('--pr-alpha', type=float, default=0.6,
-                        help='alpha parameter for prioritized replay buffer')
-    parser.add_argument('--pr-beta0', type=float, default=0.4,
-                        help='initial value of beta for prioritized replay buffer')
-    parser.add_argument('--pr-eps', type=float, default=1e-6,
-                        help='epsilon to add to the TD errors when updating priorities.')
-    parser.add_argument('--gamma', type=float, default=0.99,
-                        help='the discount factor gamma')
-    parser.add_argument('--target-network-frequency', type=int, default=1000,
-                        help="the timesteps it takes to update the target network")
-    parser.add_argument('--max-grad-norm', type=float, default=0.5,
-                        help='the maximum norm for the gradient clipping')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help="the batch size of sample from the reply memory")
-    parser.add_argument('--start-e', type=float, default=1.,
-                        help="the starting epsilon for exploration")
-    parser.add_argument('--end-e', type=float, default=0.02,
-                        help="the ending epsilon for exploration")
-    parser.add_argument('--exploration-fraction', type=float, default=0.10,
-                        help="the fraction of `total-timesteps` it takes from start-e to go end-e")
-    parser.add_argument('--learning-starts', type=int, default=80000,
-                        help="timestep to start learning")
-    parser.add_argument('--train-frequency', type=int, default=4,
-                        help="the frequency of training")
-    args = parser.parse_args()
-    if not args.seed:
-        args.seed = int(time.time())
+import glob
 
 class QValueVisualizationWrapper(gym.Wrapper):
     def __init__(self, env):
@@ -765,51 +698,6 @@ class QValueVisualizationWrapper(gym.Wrapper):
         else:
             super().render(mode)
 
-# TRY NOT TO MODIFY: setup the environment
-experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-writer = SummaryWriter(f"runs/{experiment_name}")
-writer.add_text('hyperparameters', "|param|value|\n|-|-|\n%s" % (
-        '\n'.join([f"|{key}|{value}|" for key, value in vars(args).items()])))
-if args.prod_mode:
-    import wandb
-    wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, sync_tensorboard=True, config=vars(args), name=experiment_name, monitor_gym=True, save_code=True)
-    writer = SummaryWriter(f"/tmp/{experiment_name}")
-
-# TRY NOT TO MODIFY: seeding
-device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
-env = gym.make(args.gym_id)
-env = wrap_atari(env)
-env = gym.wrappers.RecordEpisodeStatistics(env) # records episode reward in `info['episode']['r']`
-if args.capture_video:
-    env = QValueVisualizationWrapper(env)
-    env = Monitor(env, f'videos/{experiment_name}')
-env = wrap_deepmind(
-    env,
-    clip_rewards=True,
-    frame_stack=True,
-    scale=False,
-)
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.backends.cudnn.deterministic = args.torch_deterministic
-env.seed(args.seed)
-env.action_space.seed(args.seed)
-env.observation_space.seed(args.seed)
-# respect the default timelimit
-assert isinstance(env.action_space, Discrete), "only discrete action space is supported"
-
-# modified from https://github.com/openai/baselines/blob/master/baselines/deepq/replay_buffer.py
-
-# ALGO LOGIC: initialize agent here:
-# tricks taken from https://github.com/cpnota/autonomous-learning-library/blob/6d1111afce0d1582de463326f7d078a86e850551/all/presets/atari/models/__init__.py#L16
-# apparently matters
-class Linear0(nn.Linear):
-    def reset_parameters(self):
-        nn.init.constant_(self.weight, 0.0)
-        if self.bias is not None:
-            nn.init.constant_(self.bias, 0.0)
-
 class Scale(nn.Module):
     def __init__(self, scale):
         super().__init__()
@@ -818,8 +706,9 @@ class Scale(nn.Module):
     def forward(self, x):
         return x * self.scale
 class QNetwork(nn.Module):
-    def __init__(self, frames=4):
+    def __init__(self, env, device="cpu", frames=4):
         super(QNetwork, self).__init__()
+        self.device = device
         self.network = nn.Sequential(
             Scale(1/255),
             nn.Conv2d(frames, 32, 8, stride=4),
@@ -831,11 +720,11 @@ class QNetwork(nn.Module):
             nn.Flatten(),
             nn.Linear(3136, 512),
             nn.ReLU(),
-            Linear0(512, env.action_space.n)
+            nn.Linear(512, env.action_space.n)
         )
 
-    def forward(self, x):
-        x = torch.Tensor(x).to(device)
+    def forward(self, x, device):
+        x = torch.Tensor(x).to(self.device)
         return self.network(x)
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -845,81 +734,345 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     else:
         return min(slope * t + start_e, end_e)
 
-rb = PrioritizedReplayBuffer(args.buffer_size, args.pr_alpha)
-q_network = QNetwork().to(device)
-target_network = QNetwork().to(device)
-target_network.load_state_dict(q_network.state_dict())
-optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-loss_fn = nn.MSELoss()
-print(device.__repr__())
-print(q_network)
-
-# TRY NOT TO MODIFY: start the game
-obs = env.reset()
-episode_reward = 0
-for global_step in range(args.total_timesteps):
-    # ALGO LOGIC: put action logic here
-    epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction*args.total_timesteps, global_step)
-    beta = linear_schedule(args.pr_beta0, 1.0, args.total_timesteps, global_step)
-    obs = np.array(obs)
-    logits = q_network.forward(obs.reshape((1,)+obs.shape))
+def act(args, experiment_name, i, q_network, target_network, lock, rollouts_queue, stats_queue, global_step, device):
+    env = gym.make(args.gym_id)
+    env = wrap_atari(env)
+    env = gym.wrappers.RecordEpisodeStatistics(env) # records episode reward in `info['episode']['r']`
     if args.capture_video:
-        env.set_q_values(logits.tolist())
-    if random.random() < epsilon:
-        action = env.action_space.sample()
-    else:
-        action = torch.argmax(logits, dim=1).tolist()[0]
-
-    # TRY NOT TO MODIFY: execute the game and log data.
-    next_obs, reward, done, info = env.step(action)
-    episode_reward += reward
+        if i == 0:
+            env = QValueVisualizationWrapper(env)
+            env = Monitor(env, f'videos/{experiment_name}')
+    env = wrap_deepmind(
+        env,
+        clip_rewards=True,
+        frame_stack=True,
+        scale=False,
+    )
+    env.seed(args.seed+i)
+    env.action_space.seed(args.seed+i)
+    # TRY NOT TO MODIFY: start the game
+    obs = env.reset()
+    storage = []
+    episode_reward = 0
+    update_step = 0
+    while True:
+        update_step += 1
+        # global_step *= args.num_actor
+        # ALGO LOGIC: put action logic here
+        epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction*args.total_timesteps, global_step)
+        obs = np.array(obs)
+        logits = q_network.forward(obs.reshape((1,)+obs.shape), device)
+        if args.capture_video:
+            if i == 0:
+                env.set_q_values(logits.tolist())
+        if random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            action = torch.argmax(logits, dim=1).tolist()[0]
     
-    # TRY NOT TO MODIFY: record rewards for plotting purposes
-    if 'episode' in info.keys():
-        print(f"global_step={global_step}, episode_reward={info['episode']['r']}")
-        writer.add_scalar("charts/episode_reward", info['episode']['r'], global_step)
-        writer.add_scalar("charts/epsilon", epsilon, global_step)
-
-    # ALGO LOGIC: training.
-    rb.add(obs, action, reward, next_obs, float(done))
-    if global_step > args.learning_starts and global_step % args.train_frequency == 0:
-        experience = rb.sample(args.batch_size, beta=beta)
-        (s_obs, s_actions, s_rewards, s_next_obses, s_dones, s_weights, s_batch_idxes) = experience
-        # s_obs, s_actions, s_rewards, s_next_obses, s_dones = rb.sample(args.batch_size)
-        with torch.no_grad():
-            # target_max = torch.max(target_network.forward(s_next_obses), dim=1)[0]
-            current_value = q_network.forward(s_next_obses)
-            target_value = target_network.forward(s_next_obses)
-            target_max = target_value.gather(1, torch.max(current_value, 1)[1].unsqueeze(1)).squeeze(1)
-            td_target = torch.Tensor(s_rewards).to(device) + args.gamma * target_max * (1 - torch.Tensor(s_dones).to(device))
-
-        old_val = q_network.forward(s_obs).gather(1, torch.LongTensor(s_actions).view(-1,1).to(device)).squeeze()
-        td_errors = td_target - old_val
+        # TRY NOT TO MODIFY: execute the game and log data.
+        next_obs, reward, done, info = env.step(action)
+        episode_reward += reward
+        storage += [(obs, action, reward, next_obs, float(done))]
+        with lock:
+            global_step += 1
+        if 'episode' in info.keys():
+            stats_queue.put(("charts/episode_reward", info['episode']['r'], info['episode']['l']))
         
+        if len(storage) == args.actor_buffer_size:
+            obses_t, actions, rewards, obses_tp1, dones = [], [], [], [], []
+            for data in storage:
+                obs_t, action, reward, obs_tp1, done = data
+                obses_t.append(np.array(obs_t, copy=False))
+                actions.append(np.array(action, copy=False))
+                rewards.append(reward)
+                obses_tp1.append(np.array(obs_tp1, copy=False))
+                dones.append(done)
+            s_obs, s_actions, s_rewards, s_next_obses, s_dones = np.array(obses_t), np.array(actions), np.array(rewards), np.array(obses_tp1), np.array(dones)
+
+            with torch.no_grad():
+                # target_max = torch.max(target_network.forward(s_next_obses), dim=1)[0]
+                current_value = q_network.forward(s_next_obses, device)
+                target_value = target_network.forward(s_next_obses, device)
+                target_max = target_value.gather(1, torch.max(current_value, 1)[1].unsqueeze(1)).squeeze(1)
+                td_target = torch.Tensor(s_rewards).to(device) + args.gamma * target_max * (1 - torch.Tensor(s_dones).to(device))
+                
+                old_val = q_network.forward(s_obs, device).gather(1, torch.LongTensor(s_actions).view(-1,1).to(device)).squeeze()
+                td_errors = td_target - old_val
+            new_priorities = np.abs(td_errors.tolist()) + args.pr_eps
+            rollouts_queue.put((storage, new_priorities))
+            storage = []
+
+        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook 
+        obs = next_obs
+        if done:
+            # important to note that because `EpisodicLifeEnv` wrapper is applied,
+            # the real episode reward is actually the sum of episode reward of 5 lives
+            # which we record through `info['episode']['r']` provided by gym.wrappers.RecordEpisodeStatistics
+            obs, episode_reward = env.reset(), 0
+
+def data_process(args, i, global_step, rollouts_queue, data_process_queue, data_process_back_queues, device):
+    worker_rb_size = args.buffer_size // args.num_data_processors
+    rb = CustomPrioritizedReplayBuffer(worker_rb_size, args.pr_alpha)
+    while True:
+        (storage, new_priorities) = rollouts_queue.get()
+        for data, priority in zip(storage, new_priorities):
+            obs, action, reward, next_obs, done = data
+            rb.add_with_priority(obs, action, reward, next_obs, done, priority)
+        if len(rb) > args.learning_starts // args.num_data_processors:
+            beta = linear_schedule(args.pr_beta0, 1.0, args.total_timesteps, global_step)
+            experience = rb.sample(args.batch_size, beta=beta)
+            (s_obs, s_actions, s_rewards, s_next_obses, s_dones, s_weights, s_batch_idxes) = experience
+            
+            s_obs, s_actions, s_rewards, s_next_obses, s_dones = torch.Tensor(s_obs).to(device), torch.LongTensor(s_actions).to(device), torch.Tensor(s_rewards).to(device), torch.Tensor(s_next_obses).to(device), torch.Tensor(s_dones).to(device)
+            data_process_queue.put([i, s_obs, s_actions, s_rewards, s_next_obses, s_dones])
+            new_priorities = data_process_back_queues[i].get()
+            rb.update_priorities(s_batch_idxes, new_priorities)
+            del new_priorities
+
+def learn(args, rb, global_step, data_process_queue, data_process_back_queues, stats_queue, lock, learn_target_network, target_network, learn_q_network, q_network, optimizer, device):
+    update_step = 0
+    while True:
+        update_step += 1
+        experience = data_process_queue.get()
+        (i, s_obs, s_actions, s_rewards, s_next_obses, s_dones) = experience
+        with torch.no_grad():
+            current_value = learn_q_network.network(s_next_obses)
+            target_value = learn_target_network.network(s_next_obses)
+            target_max = target_value.gather(1, torch.max(current_value, 1)[1].unsqueeze(1)).squeeze(1)
+
+            td_target = s_rewards + args.gamma * target_max * (1 - s_dones)
+
+        old_val = learn_q_network.network(s_obs).gather(1, s_actions.view(-1,1)).squeeze()
+        td_errors = td_target - old_val
         loss = (td_errors ** 2).mean()
-        writer.add_scalar("losses/td_loss", loss, global_step)
         
         # update the weights in the prioritized replay
         new_priorities = np.abs(td_errors.tolist()) + args.pr_eps
-        rb.update_priorities(s_batch_idxes, new_priorities)
-
+        data_process_back_queues[i].put(new_priorities)
+        
+        stats_queue.put(("losses/td_loss", loss.item(), update_step+args.learning_starts))
+    
         # optimize the midel
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(list(q_network.parameters()), args.max_grad_norm)
+        nn.utils.clip_grad_norm_(list(learn_q_network.parameters()), args.max_grad_norm)
         optimizer.step()
-
+        q_network.load_state_dict(learn_q_network.state_dict())
+        del i, s_obs, s_actions, s_rewards, s_next_obses, s_dones
+    
         # update the target network
-        if global_step % args.target_network_frequency == 0:
-            target_network.load_state_dict(q_network.state_dict())
+        if update_step % args.target_network_frequency == 0:
+            learn_target_network.load_state_dict(learn_q_network.state_dict())
+            target_network.load_state_dict(learn_q_network.state_dict())
 
-    # TRY NOT TO MODIFY: CRUCIAL step easy to overlook 
-    obs = next_obs
-    if done:
-        # important to note that because `EpisodicLifeEnv` wrapper is applied,
-        # the real episode reward is actually the sum of episode reward of 5 lives
-        # which we record through `info['episode']['r']` provided by gym.wrappers.RecordEpisodeStatistics
-        obs, episode_reward = env.reset(), 0
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='DQN agent')
+    # Common arguments
+    parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
+                        help='the name of this experiment')
+    parser.add_argument('--gym-id', type=str, default="BreakoutNoFrameskip-v4",
+                        help='the id of the gym environment')
+    parser.add_argument('--learning-rate', type=float, default=1e-4,
+                        help='the learning rate of the optimizer')
+    parser.add_argument('--seed', type=int, default=2,
+                        help='seed of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=10000000,
+                        help='total timesteps of the experiments')
+    parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, `torch.backends.cudnn.deterministic=False`')
+    parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, cuda will not be enabled by default')
+    parser.add_argument('--prod-mode', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='run the script in production mode and use wandb to log outputs')
+    parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='weather to capture videos of the agent performances (check out `videos` folder)')
+    parser.add_argument('--wandb-project-name', type=str, default="cleanRL",
+                        help="the wandb's project name")
+    parser.add_argument('--wandb-entity', type=str, default=None,
+                        help="the entity (team) of wandb's project")
+    
+    # Algorithm specific arguments
+    parser.add_argument('--num-actors', type=int, default=4,
+                         help='the replay memory buffer size')
+    parser.add_argument('--num-data-processors', type=int, default=2,
+                         help='the replay memory buffer size')
+    parser.add_argument('--actor-buffer-size', type=int, default=50,
+                         help='the replay memory buffer size')
+    parser.add_argument('--buffer-size', type=int, default=100000,
+                         help='the replay memory buffer size')
+    parser.add_argument('--pr-alpha', type=float, default=0.6,
+                        help='alpha parameter for prioritized replay buffer')
+    parser.add_argument('--pr-beta0', type=float, default=0.4,
+                        help='initial value of beta for prioritized replay buffer')
+    parser.add_argument('--pr-eps', type=float, default=1e-6,
+                        help='epsilon to add to the TD errors when updating priorities.')
+    parser.add_argument('--gamma', type=float, default=0.99,
+                        help='the discount factor gamma')
+    parser.add_argument('--target-network-frequency', type=int, default=1000,
+                        help="the timesteps it takes to update the target network")
+    parser.add_argument('--max-grad-norm', type=float, default=0.5,
+                        help='the maximum norm for the gradient clipping')
+    parser.add_argument('--batch-size', type=int, default=256,
+                        help="the batch size of sample from the reply memory")
+    parser.add_argument('--start-e', type=float, default=1.,
+                        help="the starting epsilon for exploration")
+    parser.add_argument('--end-e', type=float, default=0.02,
+                        help="the ending epsilon for exploration")
+    parser.add_argument('--exploration-fraction', type=float, default=0.10,
+                        help="the fraction of `total-timesteps` it takes from start-e to go end-e")
+    parser.add_argument('--learning-starts', type=int, default=80000,
+                        help="timestep to start learning")
+    parser.add_argument('--train-frequency', type=int, default=4,
+                        help="the frequency of training")
+    args = parser.parse_args()
+    if not args.seed:
+        args.seed = int(time.time())
 
-env.close()
-writer.close()
+    # TRY NOT TO MODIFY: setup the environment
+    experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    writer = SummaryWriter(f"runs/{experiment_name}")
+    writer.add_text('hyperparameters', "|param|value|\n|-|-|\n%s" % (
+            '\n'.join([f"|{key}|{value}|" for key, value in vars(args).items()])))
+    if args.prod_mode:
+        import wandb
+        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, sync_tensorboard=True, config=vars(args), name=experiment_name, monitor_gym=True, save_code=True)
+        writer = SummaryWriter(f"/tmp/{experiment_name}")
+    
+    # TRY NOT TO MODIFY: seeding
+    device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
+    env = gym.make(args.gym_id)
+    env = wrap_atari(env)
+    env = gym.wrappers.RecordEpisodeStatistics(env) # records episode reward in `info['episode']['r']`
+    env = wrap_deepmind(
+        env,
+        clip_rewards=True,
+        frame_stack=True,
+        scale=False,
+    )
+    env.seed(args.seed)
+    env.action_space.seed(args.seed)
+    env.observation_space.seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+    assert isinstance(env.action_space, Discrete), "only discrete action space is supported"
+
+    m = SyncManager()
+    m.start()
+    lock = m.Lock()
+    rb = CustomPrioritizedReplayBuffer(args.buffer_size, args.pr_alpha)
+
+    q_network = QNetwork(env)
+    target_network = QNetwork(env)
+    target_network.load_state_dict(q_network.state_dict())
+    learn_q_network = QNetwork(env, device).to(device)
+    learn_q_network.load_state_dict(q_network.state_dict())
+    learn_target_network = QNetwork(env, device).to(device)
+    learn_target_network.load_state_dict(q_network.state_dict())
+    optimizer = optim.Adam(learn_q_network.parameters(), lr=args.learning_rate)
+
+    print(device.__repr__())
+    print(q_network)
+
+    global_step = torch.tensor(0)
+    global_step.share_memory_()
+    actor_processes = []
+    data_processor_processes = []
+    ctx = mp.get_context("forkserver")
+    stats_queue = ctx.Queue(10)
+    rollouts_queue = ctx.Queue(10)
+    data_process_queue = ctx.Queue(10)
+    data_process_back_queues = []
+    
+    for i in range(args.num_actors):
+        actor = ctx.Process(
+            target=act,
+            args=(
+                args,
+                experiment_name,
+                i,
+                q_network,
+                target_network,
+                lock,
+                rollouts_queue,
+                stats_queue,
+                global_step,
+                "cpu"
+            ),
+        )
+        actor.start()
+        actor_processes.append(actor)
+        
+    for i in range(args.num_data_processors):
+        data_process_back_queues += [ctx.Queue(1)]
+        data_processor = ctx.Process(
+            target=data_process,
+            args=(
+                args,
+                i,
+                global_step,
+                rollouts_queue,
+                data_process_queue,
+                data_process_back_queues,
+                device
+            ),
+        )
+        data_processor.start()
+        data_processor_processes.append(data_processor)
+
+
+    learner = ctx.Process(
+        target=learn,
+        args=(
+            args, rb, global_step,
+            data_process_queue,
+            data_process_back_queues, stats_queue, lock, learn_target_network, target_network, learn_q_network, q_network, optimizer, device
+        ),
+    )
+    learner.start()
+
+    import timeit
+    timer = timeit.default_timer
+    existing_video_files = []
+    try:
+        while global_step < args.total_timesteps:
+            start_global_step = global_step.item()
+            start_time = timer()
+            m = stats_queue.get()
+            if m[0] == "charts/episode_reward":
+                r, l = m[1], m[2]
+                print(f"global_step={global_step}, episode_reward={r}")
+                writer.add_scalar("charts/episode_reward", r, global_step)
+                writer.add_scalar("charts/stats_queue_size", stats_queue.qsize(), global_step)
+                writer.add_scalar("charts/rollouts_queue_size", rollouts_queue.qsize(), global_step)
+                writer.add_scalar("charts/data_process_queue_size", data_process_queue.qsize(), global_step)
+                writer.add_scalar("charts/fps", (global_step.item() - start_global_step) / (timer() - start_time), global_step)
+                print("FPS: ", (global_step.item() - start_global_step) / (timer() - start_time))
+            else:
+                # print(m[0], m[1], global_step)
+                writer.add_scalar(m[0], m[1], global_step)
+            if args.capture_video and args.prod_mode:
+                video_files = glob.glob(f'videos/{experiment_name}/*.mp4')
+                for video_file in video_files:
+                    if video_file not in existing_video_files:
+                        existing_video_files += [video_file]
+                        print(video_file)
+                        if len(existing_video_files) > 1:
+                            wandb.log({"video.0": wandb.Video(existing_video_files[-2])})
+    except KeyboardInterrupt:
+        pass
+    finally:
+        learner.terminate()
+        learner.join(timeout=1)
+        for actor in actor_processes:
+            actor.terminate()
+            actor.join(timeout=1)
+        for data_processor in data_processor_processes:
+            data_processor.terminate()
+            data_processor.join(timeout=1)
+        if args.capture_video and args.prod_mode:
+            wandb.log({"video.0": wandb.Video(existing_video_files[-1])})
+    # env.close()
+    writer.close()

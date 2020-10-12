@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.distributions.normal import Normal
+from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 import argparse
 from distutils.util import strtobool
 import numpy as np
 import gym
+import procgen
 from gym.wrappers import TimeLimit, Monitor
 import pybullet_envs
 from gym.spaces import Discrete, Box, MultiBinary, MultiDiscrete, Space
@@ -16,6 +17,82 @@ import time
 import random
 import os
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnvWrapper
+
+import matplotlib
+matplotlib.use('Agg')
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+from PIL import Image
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PPO agent')
+    # Common arguments
+    parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
+                        help='the name of this experiment')
+    parser.add_argument('--gym-id', type=str, default="procgen-starpilot-v0",
+                        help='the id of the gym environment')
+    parser.add_argument('--learning-rate', type=float, default=2.5e-4,
+                        help='the learning rate of the optimizer')
+    parser.add_argument('--seed', type=int, default=1,
+                        help='seed of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=int(25e6),
+                        help='total timesteps of the experiments')
+    parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, `torch.backends.cudnn.deterministic=False`')
+    parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                        help='if toggled, cuda will not be enabled by default')
+    parser.add_argument('--prod-mode', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='run the script in production mode and use wandb to log outputs')
+    parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='weather to capture videos of the agent performances (check out `videos` folder)')
+    parser.add_argument('--wandb-project-name', type=str, default="cleanRL",
+                        help="the wandb's project name")
+    parser.add_argument('--wandb-entity', type=str, default=None,
+                        help="the entity (team) of wandb's project")
+
+    # Algorithm specific arguments
+    parser.add_argument('--n-minibatch', type=int, default=8,
+                        help='the number of mini batch')
+    parser.add_argument('--num-envs', type=int, default=64,
+                        help='the number of parallel game environment')
+    parser.add_argument('--num-steps', type=int, default=256,
+                        help='the number of steps per game environment')
+    parser.add_argument('--gamma', type=float, default=0.999,
+                        help='the discount factor gamma')
+    parser.add_argument('--gae-lambda', type=float, default=0.95,
+                        help='the lambda for the general advantage estimation')
+    parser.add_argument('--ent-coef', type=float, default=0.01,
+                        help="coefficient of the entropy")
+    parser.add_argument('--vf-coef', type=float, default=0.5,
+                        help="coefficient of the value function")
+    parser.add_argument('--max-grad-norm', type=float, default=0.5,
+                        help='the maximum norm for the gradient clipping')
+    parser.add_argument('--clip-coef', type=float, default=0.2,
+                        help="the surrogate clipping coefficient")
+    parser.add_argument('--update-epochs', type=int, default=3,
+                         help="the K epochs to update the policy")
+    parser.add_argument('--kle-stop', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                         help='If toggled, the policy updates will be early stopped w.r.t target-kl')
+    parser.add_argument('--kle-rollback', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+                         help='If toggled, the policy updates will roll back to previous policy if KL exceeds target-kl')
+    parser.add_argument('--target-kl', type=float, default=0.03,
+                         help='the target-kl variable that is referred by --kl')
+    parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                         help='Use GAE for advantage computation')
+    parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                          help="Toggles advantages normalization")
+    parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                          help="Toggle learning rate annealing for policy and value networks")
+    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
+                          help='Toggles wheter or not to use a clipped loss for the value function, as per the paper.')
+
+    args = parser.parse_args()
+    if not args.seed:
+        args.seed = int(time.time())
+
+args.batch_size = int(args.num_envs * args.num_steps)
+args.minibatch_size = int(args.batch_size // args.n_minibatch)
 
 # taken from https://github.com/openai/baselines/blob/master/baselines/common/vec_env/vec_normalize.py
 class RunningMeanStd(object):
@@ -82,81 +159,31 @@ class NormalizedEnv(gym.core.Wrapper):
         obs = self.env.reset()
         return self._obfilt(obs)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='PPO agent')
-    # Common arguments
-    parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
-                        help='the name of this experiment')
-    parser.add_argument('--gym-id', type=str, default="HopperBulletEnv-v0",
-                        help='the id of the gym environment')
-    parser.add_argument('--learning-rate', type=float, default=3e-4,
-                        help='the learning rate of the optimizer')
-    parser.add_argument('--seed', type=int, default=1,
-                        help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=2000000,
-                        help='total timesteps of the experiments')
-    parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                        help='if toggled, `torch.backends.cudnn.deterministic=False`')
-    parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                        help='if toggled, cuda will not be enabled by default')
-    parser.add_argument('--prod-mode', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
-                        help='run the script in production mode and use wandb to log outputs')
-    parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                        help='weather to capture videos of the agent performances (check out `videos` folder)')
-    parser.add_argument('--wandb-project-name', type=str, default="cleanRL",
-                        help="the wandb's project name")
-    parser.add_argument('--wandb-entity', type=str, default=None,
-                        help="the entity (team) of wandb's project")
+class ClipRewardEnv(gym.RewardWrapper):
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)
 
-    # Algorithm specific arguments
-    parser.add_argument('--n-minibatch', type=int, default=32,
-                        help='the number of mini batch')
-    parser.add_argument('--num-envs', type=int, default=1,
-                        help='the number of parallel game environment')
-    parser.add_argument('--num-steps', type=int, default=2048,
-                        help='the number of steps per game environment')
-    parser.add_argument('--gamma', type=float, default=0.99,
-                        help='the discount factor gamma')
-    parser.add_argument('--gae-lambda', type=float, default=0.95,
-                        help='the lambda for the general advantage estimation')
-    parser.add_argument('--ent-coef', type=float, default=0.0,
-                        help="coefficient of the entropy")
-    parser.add_argument('--vf-coef', type=float, default=0.5,
-                        help="coefficient of the value function")
-    parser.add_argument('--max-grad-norm', type=float, default=0.5,
-                        help='the maximum norm for the gradient clipping')
-    parser.add_argument('--clip-coef', type=float, default=0.2,
-                        help="the surrogate clipping coefficient")
-    parser.add_argument('--update-epochs', type=int, default=10,
-                         help="the K epochs to update the policy")
-    parser.add_argument('--kle-stop', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
-                         help='If toggled, the policy updates will be early stopped w.r.t target-kl')
-    parser.add_argument('--kle-rollback', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
-                         help='If toggled, the policy updates will roll back to previous policy if KL exceeds target-kl')
-    parser.add_argument('--target-kl', type=float, default=0.03,
-                         help='the target-kl variable that is referred by --kl')
-    parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                         help='Use GAE for advantage computation')
-    parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                          help="Toggles advantages normalization")
-    parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                          help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
-                          help='Toggles wheter or not to use a clipped loss for the value function, as per the paper.')
+    def reward(self, reward):
+        """Bin reward to {+1, 0, -1} by its sign."""
+        return np.sign(reward)
 
-    args = parser.parse_args()
-    if not args.seed:
-        args.seed = int(time.time())
+class ImageToPyTorch(gym.ObservationWrapper):
+    """
+    Image shape to channels x weight x height
+    """
 
-args.batch_size = int(args.num_envs * args.num_steps)
-args.minibatch_size = int(args.batch_size // args.n_minibatch)
+    def __init__(self, env):
+        super(ImageToPyTorch, self).__init__(env)
+        old_shape = self.observation_space.shape
+        self.observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(old_shape[-1], old_shape[0], old_shape[1]),
+            dtype=np.uint8,
+        )
 
-class ClipActionsWrapper(gym.Wrapper):
-    def step(self, action):
-        import numpy as np
-        action = np.nan_to_num(action)
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        return self.env.step(action)
+    def observation(self, observation):
+        return np.transpose(observation, axes=(2, 0, 1))
 
 class VecPyTorch(VecEnvWrapper):
     def __init__(self, venv, device):
@@ -178,6 +205,34 @@ class VecPyTorch(VecEnvWrapper):
         reward = torch.from_numpy(reward).unsqueeze(dim=1).float()
         return obs, reward, done, info
 
+class ProbsVisualizationWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.env.reset()
+        self.image_shape = self.env.render(mode="rgb_array").shape
+        self.probs = [[0.,0.,0.,0.]]
+        # self.metadata['video.frames_per_second'] = 60
+
+    def set_probs(self, probs):
+        self.probs = probs
+
+    def render(self, mode="human"):
+        if mode=="rgb_array":
+            env_rgb_array = super().render(mode)
+            fig, ax = plt.subplots(figsize=(self.image_shape[1]/100,self.image_shape[0]/100), constrained_layout=True, dpi=100)
+            df = pd.DataFrame(np.array(self.probs).T)
+            sns.barplot(x=df.index, y=0, data=df, ax=ax)
+            ax.set(xlabel='actions', ylabel='probs')
+            fig.canvas.draw()
+            X = np.array(fig.canvas.renderer.buffer_rgba())
+            Image.fromarray(X)
+            # Image.fromarray(X)
+            rgb_image = np.array(Image.fromarray(X).convert('RGB'))
+            plt.close(fig)
+            q_value_rgb_array = rgb_image
+            return np.append(env_rgb_array, q_value_rgb_array, axis=1)
+        else:
+            super().render(mode)
 
 # TRY NOT TO MODIFY: setup the environment
 experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -197,14 +252,16 @@ torch.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = args.torch_deterministic
 def make_env(gym_id, seed, idx):
     def thunk():
-        env = gym.make(gym_id)
-        env = ClipActionsWrapper(env)
+        env = gym.make(gym_id, render_mode='rgb_array')
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NormalizedEnv(env, ob=False)
         if args.capture_video:
             if idx == 0:
+                env = ProbsVisualizationWrapper(env)
                 env = Monitor(env, f'videos/{experiment_name}')
-        env = NormalizedEnv(env)
-        env.seed(seed)
+        env = ClipRewardEnv(env)
+        env = ImageToPyTorch(env)
+        # env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -215,44 +272,52 @@ envs = VecPyTorch(DummyVecEnv([make_env(args.gym_id, args.seed+i, i) for i in ra
 #         SubprocVecEnv([make_env(args.gym_id, args.seed+i, i) for i in range(args.num_envs)], "fork"),
 #         device
 #     )
-assert isinstance(envs.action_space, Box), "only continuous action space is supported"
+assert isinstance(envs.action_space, Discrete), "only discrete action space is supported"
 
 # ALGO LOGIC: initialize agent here:
+class Scale(nn.Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        return x * self.scale
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, channels=3):
         super(Agent, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.),
+        self.network = nn.Sequential(
+            Scale(1/255),
+            layer_init(nn.Conv2d(channels, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(1024, 512)),
+            nn.ReLU()
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.action_space.shape)), std=0.01),
-        )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.action_space.shape)))
+        self.actor = layer_init(nn.Linear(512, envs.action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+    def forward(self, x):
+        return self.network(x)
 
     def get_action(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        logits = self.actor(self.forward(x))
+        probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1)
+        return action, probs.log_prob(action), probs.entropy()
 
     def get_value(self, x):
-        return self.critic(x)
+        return self.critic(self.forward(x))
 
 agent = Agent(envs).to(device)
 optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -292,6 +357,12 @@ for update in range(1, num_updates+1):
         with torch.no_grad():
             values[step] = agent.get_value(obs[step]).flatten()
             action, logproba, _ = agent.get_action(obs[step])
+
+            # visualization
+            if args.capture_video:
+                probs_list = np.array(Categorical(
+                    logits=agent.actor(agent.forward(obs[step]))).probs[0:1].tolist())
+                envs.env_method("set_probs", probs_list, indices=0)
 
         actions[step] = action
         logprobs[step] = logproba
@@ -355,7 +426,7 @@ for update in range(1, num_updates+1):
             if args.norm_adv:
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-            _, newlogproba, entropy = agent.get_action(b_obs[minibatch_ind], b_actions[minibatch_ind])
+            _, newlogproba, entropy = agent.get_action(b_obs[minibatch_ind], b_actions.long()[minibatch_ind])
             ratio = (newlogproba - b_logprobs[minibatch_ind]).exp()
 
             # Stats
@@ -389,7 +460,7 @@ for update in range(1, num_updates+1):
             if approx_kl > args.target_kl:
                 break
         if args.kle_rollback:
-            if (b_logprobs[minibatch_ind] - agent.get_action(b_obs[minibatch_ind], b_actions[minibatch_ind])[1]).mean() > args.target_kl:
+            if (b_logprobs[minibatch_ind] - agent.get_action(b_obs[minibatch_ind], b_actions.long()[minibatch_ind])[1]).mean() > args.target_kl:
                 agent.load_state_dict(target_agent.state_dict())
                 break
 

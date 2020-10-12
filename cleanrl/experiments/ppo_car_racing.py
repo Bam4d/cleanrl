@@ -1,3 +1,210 @@
+# reference: https://github.com/xtma/pytorch_car_caring
+
+import numpy as np
+from collections import deque
+import gym
+from gym import spaces
+import cv2
+cv2.ocl.setUseOpenCL(False)
+
+class MaxAndSkipEnv(gym.Wrapper):
+    def __init__(self, env, skip=8):
+        """Return only every `skip`-th frame"""
+        gym.Wrapper.__init__(self, env)
+        # most recent raw observations (for max pooling across time steps)
+        self._obs_buffer = np.zeros((2,)+env.observation_space.shape, dtype=np.uint8)
+        self._skip       = skip
+
+    def step(self, action):
+        """Repeat action, sum reward, and max over last observations."""
+        total_reward = 0.0
+        done = None
+        for i in range(self._skip):
+            obs, reward, done, info = self.env.step(action)
+            if i == self._skip - 2: self._obs_buffer[0] = obs
+            if i == self._skip - 1: self._obs_buffer[1] = obs
+            total_reward += reward
+            if done:
+                break
+        # Note that the observation on the done=True frame
+        # doesn't matter
+        max_frame = self._obs_buffer.max(axis=0)
+
+        return max_frame, total_reward, done, info
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+class ClipRewardEnv(gym.RewardWrapper):
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)
+
+    def reward(self, reward):
+        """Bin reward to {+1, 0, -1} by its sign."""
+        return np.sign(reward)
+
+
+class WarpFrame(gym.ObservationWrapper):
+    def __init__(self, env, width=96, height=96, grayscale=True, dict_space_key=None):
+        """
+        Warp frames to 84x84 as done in the Nature paper and later work.
+        If the environment uses dictionary observations, `dict_space_key` can be specified which indicates which
+        observation should be warped.
+        """
+        super().__init__(env)
+        self._width = width
+        self._height = height
+        self._grayscale = grayscale
+        self._key = dict_space_key
+        if self._grayscale:
+            num_colors = 1
+        else:
+            num_colors = 3
+
+        new_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(self._height, self._width, num_colors),
+            dtype=np.uint8,
+        )
+        if self._key is None:
+            original_space = self.observation_space
+            self.observation_space = new_space
+        else:
+            original_space = self.observation_space.spaces[self._key]
+            self.observation_space.spaces[self._key] = new_space
+        assert original_space.dtype == np.uint8 and len(original_space.shape) == 3
+
+    def observation(self, obs):
+        if self._key is None:
+            frame = obs
+        else:
+            frame = obs[self._key]
+
+        if self._grayscale:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        # frame = cv2.resize(
+        #     frame, (self._width, self._height), interpolation=cv2.INTER_AREA
+        # )
+        if self._grayscale:
+            frame = np.expand_dims(frame, -1)
+
+        if self._key is None:
+            obs = frame
+        else:
+            obs = obs.copy()
+            obs[self._key] = frame
+        return obs
+
+
+class FrameStack(gym.Wrapper):
+    def __init__(self, env, k):
+        """Stack k last frames.
+        Returns lazy array, which is much more memory efficient.
+        See Also
+        --------
+        baselines.common.atari_wrappers.LazyFrames
+        """
+        gym.Wrapper.__init__(self, env)
+        self.k = k
+        self.frames = deque([], maxlen=k)
+        shp = env.observation_space.shape
+        self.observation_space = spaces.Box(low=0, high=255, shape=(shp[:-1] + (shp[-1] * k,)), dtype=env.observation_space.dtype)
+
+    def reset(self):
+        ob = self.env.reset()
+        for _ in range(self.k):
+            self.frames.append(ob)
+        return self._get_ob()
+
+    def step(self, action):
+        ob, reward, done, info = self.env.step(action)
+        self.frames.append(ob)
+        return self._get_ob(), reward, done, info
+
+    def _get_ob(self):
+        assert len(self.frames) == self.k
+        return LazyFrames(list(self.frames))
+
+class ScaledFloatFrame(gym.ObservationWrapper):
+    def __init__(self, env):
+        gym.ObservationWrapper.__init__(self, env)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=env.observation_space.shape, dtype=np.float32)
+
+    def observation(self, observation):
+        # careful! This undoes the memory optimization, use
+        # with smaller replay buffers only.
+        return np.array(observation).astype(np.float32) / 255.0
+
+class LazyFrames(object):
+    def __init__(self, frames):
+        """This object ensures that common frames between the observations are only stored once.
+        It exists purely to optimize memory usage which can be huge for DQN's 1M frames replay
+        buffers.
+        This object should only be converted to numpy array before being passed to the model.
+        You'd not believe how complex the previous solution was."""
+        self._frames = frames
+        self._out = None
+
+    def _force(self):
+        if self._out is None:
+            self._out = np.concatenate(self._frames, axis=-1)
+            self._frames = None
+        return self._out
+
+    def __array__(self, dtype=None):
+        out = self._force()
+        if dtype is not None:
+            out = out.astype(dtype)
+        return out
+
+    def __len__(self):
+        return len(self._force())
+
+    def __getitem__(self, i):
+        return self._force()[i]
+
+    def count(self):
+        frames = self._force()
+        return frames.shape[frames.ndim - 1]
+
+    def frame(self, i):
+        return self._force()[..., i]
+
+def wrap_deepmind(env, clip_rewards=True, frame_stack=False, scale=False):
+    """Configure environment for DeepMind-style Atari.
+    """
+    env = WarpFrame(env)
+    if scale:
+        env = ScaledFloatFrame(env)
+    if clip_rewards:
+        env = ClipRewardEnv(env)
+    if frame_stack:
+        env = FrameStack(env, 4)
+    return env
+
+
+class ImageToPyTorch(gym.ObservationWrapper):
+    """
+    Image shape to channels x weight x height
+    """
+
+    def __init__(self, env):
+        super(ImageToPyTorch, self).__init__(env)
+        old_shape = self.observation_space.shape
+        self.observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(old_shape[-1], old_shape[0], old_shape[1]),
+            dtype=np.uint8,
+        )
+
+    def observation(self, observation):
+        return np.transpose(observation, axes=(2, 0, 1))
+
+def wrap_pytorch(env):
+    return ImageToPyTorch(env)
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +223,7 @@ import time
 import random
 import os
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnvWrapper
+
 
 # taken from https://github.com/openai/baselines/blob/master/baselines/common/vec_env/vec_normalize.py
 class RunningMeanStd(object):
@@ -87,7 +295,7 @@ if __name__ == "__main__":
     # Common arguments
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='the name of this experiment')
-    parser.add_argument('--gym-id', type=str, default="HopperBulletEnv-v0",
+    parser.add_argument('--gym-id', type=str, default="CarRacing-v0",
                         help='the id of the gym environment')
     parser.add_argument('--learning-rate', type=float, default=3e-4,
                         help='the learning rate of the optimizer')
@@ -129,7 +337,7 @@ if __name__ == "__main__":
                         help="the surrogate clipping coefficient")
     parser.add_argument('--update-epochs', type=int, default=10,
                          help="the K epochs to update the policy")
-    parser.add_argument('--kle-stop', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
+    parser.add_argument('--kle-stop', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True,
                          help='If toggled, the policy updates will be early stopped w.r.t target-kl')
     parser.add_argument('--kle-rollback', type=lambda x:bool(strtobool(x)), default=False, nargs='?', const=True,
                          help='If toggled, the policy updates will roll back to previous policy if KL exceeds target-kl')
@@ -199,7 +407,16 @@ def make_env(gym_id, seed, idx):
     def thunk():
         env = gym.make(gym_id)
         env = ClipActionsWrapper(env)
+        env = MaxAndSkipEnv(env, skip=4)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = wrap_pytorch(
+            wrap_deepmind(
+                env,
+                clip_rewards=False,
+                frame_stack=True,
+                scale=False,
+            )
+        )
         if args.capture_video:
             if idx == 0:
                 env = Monitor(env, f'videos/{experiment_name}')
@@ -218,32 +435,41 @@ envs = VecPyTorch(DummyVecEnv([make_env(args.gym_id, args.seed+i, i) for i in ra
 assert isinstance(envs.action_space, Box), "only continuous action space is supported"
 
 # ALGO LOGIC: initialize agent here:
+class Scale(nn.Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        return x * self.scale
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, frames=4):
         super(Agent, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.),
+        self.network = nn.Sequential(
+            Scale(1/255),
+            layer_init(nn.Conv2d(frames, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(4096, 512)),
+            nn.ReLU()
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.action_space.shape)), std=0.01),
-        )
+        self.actor_mean = layer_init(nn.Linear(512, np.prod(envs.action_space.shape)), std=0.01)
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.action_space.shape)))
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
 
     def get_action(self, x, action=None):
-        action_mean = self.actor_mean(x)
+        
+        action_mean = self.actor_mean(self.network(x))
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
@@ -252,9 +478,9 @@ class Agent(nn.Module):
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1)
 
     def get_value(self, x):
-        return self.critic(x)
+        return self.critic(self.network(x))
 
-agent = Agent(envs).to(device)
+agent = Agent().to(device)
 optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 if args.anneal_lr:
     # https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/ppo2/defaults.py#L20
@@ -343,7 +569,7 @@ for update in range(1, num_updates+1):
     b_values = values.reshape(-1)
 
     # Optimizaing the policy and value network
-    target_agent = Agent(envs).to(device)
+    target_agent = Agent().to(device)
     inds = np.arange(args.batch_size,)
     for i_epoch_pi in range(args.update_epochs):
         np.random.shuffle(inds)
