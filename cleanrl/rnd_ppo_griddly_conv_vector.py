@@ -5,6 +5,7 @@ import time
 import numpy as np
 from collections import deque
 import gym
+from griddly import GymWrapperFactory, gd
 from gym import spaces
 import cv2
 
@@ -54,306 +55,6 @@ class RewardForwardFilter(object):
         return self.rewems
 
 
-class NoopResetEnv(gym.Wrapper):
-    def __init__(self, env, noop_max=30):
-        """Sample initial states by taking random number of no-ops on reset.
-        No-op is assumed to be action 0.
-        """
-        gym.Wrapper.__init__(self, env)
-        self.noop_max = noop_max
-        self.override_num_noops = None
-        self.noop_action = 0
-        assert env.unwrapped.get_action_meanings()[0] == 'NOOP'
-
-    def reset(self, **kwargs):
-        """ Do no-op action for a number of steps in [1, noop_max]."""
-        self.env.reset(**kwargs)
-        if self.override_num_noops is not None:
-            noops = self.override_num_noops
-        else:
-            noops = self.unwrapped.np_random.randint(1, self.noop_max + 1)  # pylint: disable=E1101
-        assert noops > 0
-        obs = None
-        for _ in range(noops):
-            obs, _, done, _ = self.env.step(self.noop_action)
-            if done:
-                obs = self.env.reset(**kwargs)
-        return obs
-
-    def step(self, ac):
-        return self.env.step(ac)
-
-
-class FireResetEnv(gym.Wrapper):
-    def __init__(self, env):
-        """Take action on reset for environments that are fixed until firing."""
-        gym.Wrapper.__init__(self, env)
-        assert env.unwrapped.get_action_meanings()[1] == 'FIRE'
-        assert len(env.unwrapped.get_action_meanings()) >= 3
-
-    def reset(self, **kwargs):
-        self.env.reset(**kwargs)
-        obs, _, done, _ = self.env.step(1)
-        if done:
-            self.env.reset(**kwargs)
-        obs, _, done, _ = self.env.step(2)
-        if done:
-            self.env.reset(**kwargs)
-        return obs
-
-    def step(self, ac):
-        return self.env.step(ac)
-
-
-class EpisodicLifeEnv(gym.Wrapper):
-    def __init__(self, env):
-        """Make end-of-life == end-of-episode, but only reset on true game over.
-        Done by DeepMind for the DQN and co. since it helps value estimation.
-        """
-        gym.Wrapper.__init__(self, env)
-        self.lives = 0
-        self.was_real_done = True
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        self.was_real_done = done
-        # check current lives, make loss of life terminal,
-        # then update lives to handle bonus lives
-        lives = self.env.unwrapped.ale.lives()
-        if lives < self.lives and lives > 0:
-            # for Qbert sometimes we stay in lives == 0 condition for a few frames
-            # so it's important to keep lives > 0, so that we only reset once
-            # the environment advertises done.
-            done = True
-        self.lives = lives
-        return obs, reward, done, info
-
-    def reset(self, **kwargs):
-        """Reset only when lives are exhausted.
-        This way all states are still reachable even though lives are episodic,
-        and the learner need not know about any of this behind-the-scenes.
-        """
-        if self.was_real_done:
-            obs = self.env.reset(**kwargs)
-        else:
-            # no-op step to advance from terminal/lost life state
-            obs, _, _, _ = self.env.step(0)
-        self.lives = self.env.unwrapped.ale.lives()
-        return obs
-
-
-class MaxAndSkipEnv(gym.Wrapper):
-    def __init__(self, env, skip=4):
-        """Return only every `skip`-th frame"""
-        gym.Wrapper.__init__(self, env)
-        # most recent raw observations (for max pooling across time steps)
-        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
-        self._skip = skip
-
-    def step(self, action):
-        """Repeat action, sum reward, and max over last observations."""
-        total_reward = 0.0
-        done = None
-        for i in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
-            if i == self._skip - 2: self._obs_buffer[0] = obs
-            if i == self._skip - 1: self._obs_buffer[1] = obs
-            total_reward += reward
-            if done:
-                break
-        # Note that the observation on the done=True frame
-        # doesn't matter
-        max_frame = self._obs_buffer.max(axis=0)
-
-        return max_frame, total_reward, done, info
-
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
-
-
-class ClipRewardEnv(gym.RewardWrapper):
-    def __init__(self, env):
-        gym.RewardWrapper.__init__(self, env)
-
-    def reward(self, reward):
-        """Bin reward to {+1, 0, -1} by its sign."""
-        return np.sign(reward)
-
-
-class WarpFrame(gym.ObservationWrapper):
-    def __init__(self, env, width=84, height=84, grayscale=True, dict_space_key=None):
-        """
-        Warp frames to 84x84 as done in the Nature paper and later work.
-        If the environment uses dictionary observations, `dict_space_key` can be specified which indicates which
-        observation should be warped.
-        """
-        super().__init__(env)
-        self._width = width
-        self._height = height
-        self._grayscale = grayscale
-        self._key = dict_space_key
-        if self._grayscale:
-            num_colors = 1
-        else:
-            num_colors = 3
-
-        new_space = gym.spaces.Box(
-            low=0,
-            high=255,
-            shape=(self._height, self._width, num_colors),
-            dtype=np.uint8,
-        )
-        if self._key is None:
-            original_space = self.observation_space
-            self.observation_space = new_space
-        else:
-            original_space = self.observation_space.spaces[self._key]
-            self.observation_space.spaces[self._key] = new_space
-        assert original_space.dtype == np.uint8 and len(original_space.shape) == 3
-
-    def observation(self, obs):
-        if self._key is None:
-            frame = obs
-        else:
-            frame = obs[self._key]
-
-        if self._grayscale:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        frame = cv2.resize(
-            frame, (self._width, self._height), interpolation=cv2.INTER_AREA
-        )
-        if self._grayscale:
-            frame = np.expand_dims(frame, -1)
-
-        if self._key is None:
-            obs = frame
-        else:
-            obs = obs.copy()
-            obs[self._key] = frame
-        return obs
-
-
-class StickyAction(gym.Wrapper):
-    def __init__(self, env, sticky_action=True, p=0.25):
-        gym.Wrapper.__init__(self, env)
-        self.sticky_action = sticky_action
-        self.last_action = 0
-        self.p = p
-
-    def step(self, action):
-        if self.sticky_action:
-            if np.random.rand() <= self.p:
-                action = self.last_action
-            self.last_action = action
-        return self.env.step(action)
-
-
-class FrameStack(gym.Wrapper):
-    def __init__(self, env, k):
-        """Stack k last frames.
-        Returns lazy array, which is much more memory efficient.
-        See Also
-        --------
-        baselines.common.atari_wrappers.LazyFrames
-        """
-        gym.Wrapper.__init__(self, env)
-        self.k = k
-        self.frames = deque([], maxlen=k)
-        shp = env.observation_space.shape
-        self.observation_space = spaces.Box(low=0, high=255, shape=(shp[:-1] + (shp[-1] * k,)),
-                                            dtype=env.observation_space.dtype)
-
-    def reset(self):
-        ob = self.env.reset()
-        for _ in range(self.k):
-            self.frames.append(ob)
-        return self._get_ob()
-
-    def step(self, action):
-        ob, reward, done, info = self.env.step(action)
-        self.frames.append(ob)
-        return self._get_ob(), reward, done, info
-
-    def _get_ob(self):
-        assert len(self.frames) == self.k
-        return LazyFrames(list(self.frames))
-
-
-class ScaledFloatFrame(gym.ObservationWrapper):
-    def __init__(self, env):
-        gym.ObservationWrapper.__init__(self, env)
-        self.observation_space = gym.spaces.Box(low=0, high=1, shape=env.observation_space.shape, dtype=np.float32)
-
-    def observation(self, observation):
-        # careful! This undoes the memory optimization, use
-        # with smaller replay buffers only.
-        return np.array(observation).astype(np.float32) / 255.0
-
-
-class LazyFrames(object):
-    def __init__(self, frames):
-        """This object ensures that common frames between the observations are only stored once.
-        It exists purely to optimize memory usage which can be huge for DQN's 1M frames replay
-        buffers.
-        This object should only be converted to numpy array before being passed to the model.
-        You'd not believe how complex the previous solution was."""
-        self._frames = frames
-        self._out = None
-
-    def _force(self):
-        if self._out is None:
-            self._out = np.concatenate(self._frames, axis=-1)
-            self._frames = None
-        return self._out
-
-    def __array__(self, dtype=None):
-        out = self._force()
-        if dtype is not None:
-            out = out.astype(dtype)
-        return out
-
-    def __len__(self):
-        return len(self._force())
-
-    def __getitem__(self, i):
-        return self._force()[i]
-
-    def count(self):
-        frames = self._force()
-        return frames.shape[frames.ndim - 1]
-
-    def frame(self, i):
-        return self._force()[..., i]
-
-
-def wrap_atari(env, max_episode_steps=None, sticky_action=True):
-    assert 'NoFrameskip' in env.spec.id
-    env = NoopResetEnv(env, noop_max=30)
-    env = MaxAndSkipEnv(env, skip=4)
-    if sticky_action:
-        env = StickyAction(env)
-    assert max_episode_steps is None
-
-    return env
-
-
-def wrap_deepmind(env, episode_life=True, clip_rewards=True, frame_stack=False, scale=False):
-    """Configure environment for DeepMind-style Atari.
-    """
-    if episode_life:
-        env = EpisodicLifeEnv(env)
-    if 'FIRE' in env.unwrapped.get_action_meanings():
-        env = FireResetEnv(env)
-    env = WarpFrame(env)
-    if scale:
-        env = ScaledFloatFrame(env)
-    if clip_rewards:
-        env = ClipRewardEnv(env)
-    if frame_stack:
-        env = FrameStack(env, 4)
-    return env
-
-
 class ImageToPyTorch(gym.ObservationWrapper):
     """
     Image shape to channels x weight x height
@@ -388,9 +89,8 @@ import argparse
 from distutils.util import strtobool
 import numpy as np
 import gym
-import vizdoomgym
+import griddly
 from gym.wrappers import TimeLimit, Monitor
-import pybullet_envs
 from gym.spaces import Discrete, Box, MultiBinary, MultiDiscrete, Space
 import time
 import random
@@ -410,13 +110,13 @@ if __name__ == "__main__":
     # Common arguments
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='the name of this experiment')
-    parser.add_argument('--gym-id', type=str, default="BreakoutNoFrameskip-v4",
+    parser.add_argument('--gym-id', type=str, default="GDY-Clusters-v0",
                         help='the id of the gym environment')
     parser.add_argument('--learning-rate', type=float, default=2.5e-4,
                         help='the learning rate of the optimizer')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=10000000,
+    parser.add_argument('--total-timesteps', type=int, default=1280000,
                         help='total timesteps of the experiments')
     parser.add_argument('--torch-deterministic', type=lambda x: bool(strtobool(x)), default=True, nargs='?', const=True,
                         help='if toggled, `torch.backends.cudnn.deterministic=False`')
@@ -471,6 +171,12 @@ if __name__ == "__main__":
     parser.add_argument('--sticky-action', type=lambda x: bool(strtobool(x)), default=True, nargs='?', const=True,
                         help='Toggles wheter or not to use sticky action.')
 
+    parser.add_argument('--griddly-gdy-file', default='Single-Player/GVGAI/clusters.yaml',
+                        help='Toggles wheter or not to use sticky action.')
+    parser.add_argument('--griddly-level', type=int, default=0, help='The level number to train')
+    parser.add_argument('--griddly-observer', default='SPRITE_2D',
+                        help='The griddly observer to show the agent playing games')
+
     # RND arguments
     parser.add_argument('--update-proportion', type=float, default=0.25,
                         help="proportion of exp used for predictor update")
@@ -511,7 +217,7 @@ class ProbsVisualizationWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.env.reset()
-        self.image_shape = self.env.render(mode="rgb_array").shape
+        self.image_shape = self.env.render(mode="rgb_array", observer='global').shape
         self.probs = [[0., 0., 0., 0.]]
         # self.metadata['video.frames_per_second'] = 60
 
@@ -520,7 +226,7 @@ class ProbsVisualizationWrapper(gym.Wrapper):
 
     def render(self, mode="human"):
         if mode == "rgb_array":
-            env_rgb_array = super().render(mode)
+            env_rgb_array = super().render(mode, observer='global')
             fig, ax = plt.subplots(figsize=(self.image_shape[1] / 100, self.image_shape[0] / 100),
                                    constrained_layout=True, dpi=100)
             df = pd.DataFrame(np.array(self.probs).T)
@@ -529,7 +235,6 @@ class ProbsVisualizationWrapper(gym.Wrapper):
             fig.canvas.draw()
             X = np.array(fig.canvas.renderer.buffer_rgba())
             Image.fromarray(X)
-            # Image.fromarray(X)
             rgb_image = np.array(Image.fromarray(X).convert('RGB'))
             plt.close(fig)
             q_value_rgb_array = rgb_image
@@ -558,25 +263,48 @@ torch.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = args.torch_deterministic
 
 
+def get_observer_type(observer_type_string):
+    if observer_type_string == 'SPRITE_2D':
+        return gd.ObserverType.SPRITE_2D
+    elif observer_type_string == 'BLOCK_2D':
+        return gd.ObserverType.BLOCK_2D
+    elif observer_type_string == 'ISOMETRIC':
+        return gd.ObserverType.ISOMETRIC
+    elif observer_type_string == 'VECTOR':
+        return gd.ObserverType.VECTOR
+
+
+griddly_gdy_filename = args.griddly_gdy_file
+griddly_level = args.griddly_level
+griddly_observer = args.griddly_observer
+
+wrapper = GymWrapperFactory()
+
+wrapper.build_gym_from_yaml(
+    'Griddly-Env',
+    griddly_gdy_filename,
+    level=griddly_level,
+    global_observer_type=get_observer_type(griddly_observer),
+    player_observer_type=gd.ObserverType.VECTOR,
+    max_steps=128,
+)
+
+
 def make_env(gym_id, seed, idx):
     def thunk():
-        env = gym.make(gym_id)
-        env = wrap_atari(env, sticky_action=args.sticky_action)
+
+        env = gym.make('GDY-Griddly-Env-v0')
+        env.reset()
+
+        # env = wrap_atari(env, sticky_action=args.sticky_action)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+
         if args.capture_video:
             if idx == 0:
                 env = ProbsVisualizationWrapper(env)
                 env = Monitor(env, f'videos/{experiment_name}',
                               video_callable=lambda episode_id: episode_id % args.video_interval == 0)
-        env = wrap_pytorch(
-            wrap_deepmind(
-                env,
-                episode_life=True,
-                clip_rewards=True,
-                frame_stack=True,
-                scale=False,
-            )
-        )
+
         env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
@@ -586,15 +314,9 @@ def make_env(gym_id, seed, idx):
 
 
 envs = VecPyTorch(DummyVecEnv([make_env(args.gym_id, args.seed + i, i) for i in range(args.num_envs)]), device)
-# if args.prod_mode:
-#     envs = VecPyTorch(
-#         SubprocVecEnv([make_env(args.gym_id, args.seed+i, i) for i in range(args.num_envs)], "fork"),
-#         device
-#     )
-assert isinstance(envs.action_space, Discrete), "only discrete action space is supported"
 
 
-# ALGO LOGIC: initialize agent here:
+# some important useful layers for generic learning
 class Scale(nn.Module):
     def __init__(self, scale):
         super().__init__()
@@ -604,6 +326,25 @@ class Scale(nn.Module):
         return x * self.scale
 
 
+class GlobalAvePool(nn.Module):
+
+    def __init__(self, final_channels):
+        super().__init__()
+        self._final_channels = final_channels
+        self._pool = nn.Sequential(
+            nn.AdaptiveAvgPool3d((final_channels,1,1)),
+            nn.Flatten(),
+        )
+
+    def forward(self, input):
+        return self._pool(input)
+
+
+class Flatten(nn.Module):
+    def forward(self, input):
+        return input.view(input.size(0), -1)
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -611,34 +352,32 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, frames=4):
+    def __init__(self, num_objects):
         super(Agent, self).__init__()
         self.network = nn.Sequential(
-            Scale(1 / 255),
-            layer_init(nn.Conv2d(frames, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(num_objects, 32, 3, padding=1)),
             nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            layer_init(nn.Conv2d(32, 64, 3, padding=1)),
             nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
             nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(3136, 256)),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
             nn.ReLU(),
-            layer_init(nn.Linear(
-                256,
-                448)),
-            nn.ReLU()
+            GlobalAvePool(2048),
+            layer_init(nn.Linear(2048, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512))
         )
         self.extra_layer = nn.Sequential(
-            layer_init(nn.Linear(448, 448), std=0.1),
+            layer_init(nn.Linear(512, 512), std=0.1),
             nn.ReLU()
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(448, 448), std=0.01),
+            layer_init(nn.Linear(512, 512), std=0.01),
             nn.ReLU(),
-            layer_init(nn.Linear(448, envs.action_space.n), std=0.01))
-        self.critic_ext = layer_init(nn.Linear(448, 1), std=0.01)
-        self.critic_int = layer_init(nn.Linear(448, 1), std=0.01)
+            layer_init(nn.Linear(512, envs.action_space.n), std=0.01))
+        self.critic_ext = layer_init(nn.Linear(512, 1), std=0.01)
+        self.critic_int = layer_init(nn.Linear(512, 1), std=0.01)
 
     def forward(self, x):
         return self.network(x)
@@ -656,70 +395,40 @@ class Agent(nn.Module):
             self.extra_layer(features) + features)
 
 
-class Flatten(nn.Module):
-    def forward(self, input):
-        return input.view(input.size(0), -1)
-
-
 class RNDModel(nn.Module):
-    def __init__(self, input_size, output_size):
+    def __init__(self, num_objects):
         super(RNDModel, self).__init__()
-
-        self.input_size = input_size
-        self.output_size = output_size
-
-        feature_output = 7 * 7 * 64
 
         # Prediction network
         self.predictor = nn.Sequential(
-            layer_init(nn.Conv2d(
-                in_channels=1,
-                out_channels=32,
-                kernel_size=8,
-                stride=4)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(
-                in_channels=32,
-                out_channels=64,
-                kernel_size=4,
-                stride=2)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(
-                in_channels=64,
-                out_channels=64,
-                kernel_size=3,
-                stride=1)),
-            nn.LeakyReLU(),
-            Flatten(),
-            layer_init(nn.Linear(feature_output, 512)),
+            layer_init(nn.Conv2d(num_objects, 32, 3, padding=1)),
             nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
+            layer_init(nn.Conv2d(32, 64, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
+            nn.ReLU(),
+            GlobalAvePool(2048),
+            layer_init(nn.Linear(2048, 512)),
             nn.ReLU(),
             layer_init(nn.Linear(512, 512))
         )
 
         # Target network
         self.target = nn.Sequential(
-            layer_init(nn.Conv2d(
-                in_channels=1,
-                out_channels=32,
-                kernel_size=8,
-                stride=4)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(
-                in_channels=32,
-                out_channels=64,
-                kernel_size=4,
-                stride=2)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(
-                in_channels=64,
-                out_channels=64,
-                kernel_size=3,
-                stride=1)),
-            nn.LeakyReLU(),
-            Flatten(),
-            layer_init(nn.Linear(feature_output, 512))
+            layer_init(nn.Conv2d(num_objects, 32, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, padding=1)),
+            nn.ReLU(),
+            GlobalAvePool(2048),
+            layer_init(nn.Linear(2048, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512))
         )
 
         # Set that target network is not trainable
@@ -733,9 +442,12 @@ class RNDModel(nn.Module):
         return predict_feature, target_feature
 
 
-agent = Agent().to(device)
+# The number of objects in the griddly environment is the size of the channels in the VECTOR observer
+num_objects = envs.observation_space.shape[0]
 
-rnd_model = RNDModel(4, envs.action_space.n).to(device)
+agent = Agent(num_objects).to(device)
+
+rnd_model = RNDModel(num_objects).to(device)
 
 optimizer = optim.Adam(list(agent.parameters()) + list(rnd_model.predictor.parameters()), lr=args.learning_rate,
                        eps=1e-5)
@@ -744,13 +456,13 @@ if args.anneal_lr:
     lr = lambda f: f * args.learning_rate
 
 reward_rms = RunningMeanStd()
-obs_rms = RunningMeanStd(shape=(1, 1, 84, 84))
+obs_rms = RunningMeanStd(shape=(1, *envs.observation_space.shape))
 
 discounted_reward = RewardForwardFilter(args.int_gamma)
 
 # ALGO Logic: Storage for epoch data
 obs = torch.zeros((args.num_steps, args.num_envs) + envs.observation_space.shape).to(device)
-actions = torch.zeros((args.num_steps, args.num_envs) + envs.action_space.shape).to(device)
+actions = torch.zeros((args.num_steps, args.num_envs)).to(device)
 logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
 rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
 curiosity_rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -765,18 +477,6 @@ global_step = 0
 next_obs = envs.reset()
 next_done = torch.zeros(args.num_envs).to(device)
 num_updates = args.total_timesteps // args.batch_size
-
-print('Start to initailize observation normalization parameter.....')
-next_ob = []
-for step in range(args.num_steps * 50):
-    acs = torch.from_numpy(np.random.randint(0, envs.action_space.n, size=(args.num_envs,)))
-    s, r, d, infos = envs.step(acs)
-    next_ob = s[:, 3, :, :].reshape([-1, 1, 84, 84])
-
-    if len(next_ob) % (args.num_steps * args.num_envs) == 0:
-        obs_rms.update(next_ob)
-        next_ob = []
-print('End to initalize...')
 
 for update in range(1, num_updates + 1):
     # Annealing the rate if instructed to do so.
@@ -809,9 +509,8 @@ for update in range(1, num_updates + 1):
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rs, ds, infos = envs.step(action)
         rewards[step], next_done = rs.view(-1), torch.Tensor(ds).to(device)
-        rnd_next_obs = torch.FloatTensor(((next_obs.data.cpu().numpy()[:, 3, :, :].reshape(args.num_envs, 1, 84,
-                                                                                           84) - obs_rms.mean) / np.sqrt(
-            obs_rms.var)).clip(-5, 5)).to(device)
+        rnd_next_obs = torch.FloatTensor(
+            ((next_obs.data.cpu().numpy() - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)).to(device)
         target_next_feature = rnd_model.target(rnd_next_obs)
         predict_next_feature = rnd_model.predictor(rnd_next_obs)
         curiosity_rewards[step] = ((target_next_feature - predict_next_feature).pow(2).sum(1) / 2).data.cpu()
@@ -890,16 +589,14 @@ for update in range(1, num_updates + 1):
 
     b_advantages = b_int_advantages * args.int_coef + b_ext_advantages * args.ext_coef
 
-    obs_rms.update(b_obs.data.cpu().numpy()[:, 3, :, :].reshape(-1, 1, 84, 84))
+    obs_rms.update(b_obs.data.cpu().numpy())
 
     # Optimizaing the policy and value network
     forward_mse = nn.MSELoss(reduction='none')
-    target_agent = Agent().to(device)
+    target_agent = Agent(num_objects).to(device)
     inds = np.arange(args.batch_size, )
 
-    rnd_next_obs = torch.FloatTensor(
-        ((b_obs.data.cpu().numpy()[:, 3, :, :].reshape(-1, 1, 84, 84) - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5,
-                                                                                                                   5)).to(
+    rnd_next_obs = torch.FloatTensor(((b_obs.data.cpu().numpy() - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)).to(
         device)
 
     for i_epoch_pi in range(args.update_epochs):
