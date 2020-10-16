@@ -246,7 +246,7 @@ class ProbsVisualizationWrapper(gym.Wrapper):
     def render(self, mode="human"):
         if mode == "rgb_array":
             env_rgb_array = self.wrap_vector_visualization(super().render(mode, observer='global'))
-            fig, ax = plt.subplots(figsize=(self.image_shape[1] / 10, self.image_shape[0] / 10),
+            fig, ax = plt.subplots(figsize=(self.image_shape[1] / 100, self.image_shape[0] / 100),
                                    constrained_layout=True, dpi=100)
             df = pd.DataFrame(np.array(self.probs).T)
             sns.barplot(x=df.index, y=0, data=df, ax=ax)
