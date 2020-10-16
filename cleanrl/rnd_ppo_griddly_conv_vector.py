@@ -215,6 +215,8 @@ class ProbsVisualizationWrapper(gym.Wrapper):
         self.probs = [[0., 0., 0., 0.]]
         # self.metadata['video.frames_per_second'] = 60
 
+        self._scale = 20
+
         observation_channels = self.observation_space.shape[0]
         HSV_tuples = [(x * 1.0 / (observation_channels + 1), 1.0, 1.0) for x in range(observation_channels + 1)]
 
@@ -239,15 +241,16 @@ class ProbsVisualizationWrapper(gym.Wrapper):
 
         buffer = self._rgb_pallette[vector_pallette].swapaxes(0, 1)
         # make the observation much bigger by repeating pixels
-        observation = buffer.repeat(10, 0).repeat(10, 1)
+        observation = buffer.repeat(self._scale, 0).repeat(self._scale, 1)
 
         return observation
 
     def render(self, mode="human"):
         if mode == "rgb_array":
+            dpi = 100
             env_rgb_array = self.wrap_vector_visualization(super().render(mode, observer='global'))
-            fig, ax = plt.subplots(figsize=(self.image_shape[1] / 100, self.image_shape[0] / 100),
-                                   constrained_layout=True, dpi=100)
+            fig, ax = plt.subplots(figsize=(self.image_shape[1]*self._scale/dpi, self.image_shape[0]*self._scale/dpi),
+                                   constrained_layout=True, dpi=dpi)
             df = pd.DataFrame(np.array(self.probs).T)
             sns.barplot(x=df.index, y=0, data=df, ax=ax)
             ax.set(xlabel='actions', ylabel='probs')
