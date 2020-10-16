@@ -1,12 +1,9 @@
 # https://github.com/facebookresearch/torchbeast/blob/master/torchbeast/core/environment.py
 
-import gc
-import time
-import numpy as np
-from collections import deque
 import gym
+import os
+import colorsys
 from griddly import GymWrapperFactory, gd
-from gym import spaces
 import cv2
 
 cv2.ocl.setUseOpenCL(False)
@@ -110,8 +107,6 @@ if __name__ == "__main__":
     # Common arguments
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='the name of this experiment')
-    parser.add_argument('--gym-id', type=str, default="GDY-Clusters-v0",
-                        help='the id of the gym environment')
     parser.add_argument('--learning-rate', type=float, default=2.5e-4,
                         help='the learning rate of the optimizer')
     parser.add_argument('--seed', type=int, default=1,
@@ -171,11 +166,10 @@ if __name__ == "__main__":
     parser.add_argument('--sticky-action', type=lambda x: bool(strtobool(x)), default=True, nargs='?', const=True,
                         help='Toggles wheter or not to use sticky action.')
 
+    # Griddly arguments
     parser.add_argument('--griddly-gdy-file', default='Single-Player/GVGAI/clusters.yaml',
                         help='Toggles wheter or not to use sticky action.')
     parser.add_argument('--griddly-level', type=int, default=0, help='The level number to train')
-    parser.add_argument('--griddly-observer', default='SPRITE_2D',
-                        help='The griddly observer to show the agent playing games')
 
     # RND arguments
     parser.add_argument('--update-proportion', type=float, default=0.25,
@@ -221,13 +215,38 @@ class ProbsVisualizationWrapper(gym.Wrapper):
         self.probs = [[0., 0., 0., 0.]]
         # self.metadata['video.frames_per_second'] = 60
 
+        observation_channels = self.observation_space.shape[0]
+        HSV_tuples = [(x * 1.0 / (observation_channels + 1), 1.0, 1.0) for x in range(observation_channels + 1)]
+
+        rgb = []
+        for hsv in HSV_tuples:
+            rgb.append(colorsys.hsv_to_rgb(*hsv))
+
+        self._rgb_pallette = (np.array(rgb) * 255).astype('uint8')
+
     def set_probs(self, probs):
         self.probs = probs
 
+    def wrap_vector_visualization(self, observation):
+
+        observation = observation.swapaxes(0,2)
+        # add extra dimension so argmax does not get confused by 0 index and empty space
+        pallette_buffer = np.ones([observation.shape[0] + 1, *observation.shape[1:]]) * 0.5
+        pallette_buffer[1:] = observation
+
+        # convert to RGB pallette
+        vector_pallette = np.argmax(pallette_buffer, axis=0)
+
+        buffer = self._rgb_pallette[vector_pallette].swapaxes(0, 1)
+        # make the observation much bigger by repeating pixels
+        observation = buffer.repeat(10, 0).repeat(10, 1)
+
+        return observation
+
     def render(self, mode="human"):
         if mode == "rgb_array":
-            env_rgb_array = super().render(mode, observer='global')
-            fig, ax = plt.subplots(figsize=(self.image_shape[1] / 100, self.image_shape[0] / 100),
+            env_rgb_array = self.wrap_vector_visualization(super().render(mode, observer='global'))
+            fig, ax = plt.subplots(figsize=(self.image_shape[1] / 10, self.image_shape[0] / 10),
                                    constrained_layout=True, dpi=100)
             df = pd.DataFrame(np.array(self.probs).T)
             sns.barplot(x=df.index, y=0, data=df, ax=ax)
@@ -244,7 +263,14 @@ class ProbsVisualizationWrapper(gym.Wrapper):
 
 
 # TRY NOT TO MODIFY: setup the environment
-experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+griddly_gdy_filename = args.griddly_gdy_file
+griddly_level = args.griddly_level
+
+wrapper = GymWrapperFactory()
+name = os.path.basename(griddly_gdy_filename).replace('.yaml', '')
+env_name = f'Griddly-{name}-{griddly_level}'
+
+experiment_name = f"{env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
 writer = SummaryWriter(f"runs/{experiment_name}")
 writer.add_text('hyperparameters', "|param|value|\n|-|-|\n%s" % (
     '\n'.join([f"|{key}|{value}|" for key, value in vars(args).items()])))
@@ -262,29 +288,11 @@ np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = args.torch_deterministic
 
-
-def get_observer_type(observer_type_string):
-    if observer_type_string == 'SPRITE_2D':
-        return gd.ObserverType.SPRITE_2D
-    elif observer_type_string == 'BLOCK_2D':
-        return gd.ObserverType.BLOCK_2D
-    elif observer_type_string == 'ISOMETRIC':
-        return gd.ObserverType.ISOMETRIC
-    elif observer_type_string == 'VECTOR':
-        return gd.ObserverType.VECTOR
-
-
-griddly_gdy_filename = args.griddly_gdy_file
-griddly_level = args.griddly_level
-griddly_observer = args.griddly_observer
-
-wrapper = GymWrapperFactory()
-
 wrapper.build_gym_from_yaml(
-    'Griddly-Env',
+    env_name,
     griddly_gdy_filename,
     level=griddly_level,
-    global_observer_type=get_observer_type(griddly_observer),
+    global_observer_type=gd.ObserverType.VECTOR,
     player_observer_type=gd.ObserverType.VECTOR,
     max_steps=128,
 )
@@ -293,7 +301,7 @@ wrapper.build_gym_from_yaml(
 def make_env(gym_id, seed, idx):
     def thunk():
 
-        env = gym.make('GDY-Griddly-Env-v0')
+        env = gym.make(f'GDY-{gym_id}-v0')
         env.reset()
 
         # env = wrap_atari(env, sticky_action=args.sticky_action)
@@ -313,7 +321,7 @@ def make_env(gym_id, seed, idx):
     return thunk
 
 
-envs = VecPyTorch(DummyVecEnv([make_env(args.gym_id, args.seed + i, i) for i in range(args.num_envs)]), device)
+envs = VecPyTorch(DummyVecEnv([make_env(env_name, args.seed + i, i) for i in range(args.num_envs)]), device)
 
 
 # some important useful layers for generic learning
@@ -332,7 +340,7 @@ class GlobalAvePool(nn.Module):
         super().__init__()
         self._final_channels = final_channels
         self._pool = nn.Sequential(
-            nn.AdaptiveAvgPool3d((final_channels,1,1)),
+            nn.AdaptiveAvgPool3d((final_channels, 1, 1)),
             nn.Flatten(),
         )
 
