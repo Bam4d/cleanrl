@@ -192,7 +192,7 @@ class VecPyTorch(VecEnvWrapper):
         self.device = device
 
     def get_tile_size(self):
-        return self.venv.get_attr('tile_size')[0]
+        return self.venv.env_method('get_tile_size')[0]
 
     def reset(self):
         obs = self.venv.reset()
@@ -593,7 +593,7 @@ for update in range(1, num_updates + 1):
 
     # Optimizaing the policy and value network
     forward_mse = nn.MSELoss(reduction='none')
-    target_agent = Agent(num_objects).to(device)
+    target_agent = Agent(tile_size).to(device)
     inds = np.arange(args.batch_size, )
 
     rnd_next_obs = torch.FloatTensor(((b_obs.data.cpu().numpy() - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)).to(
